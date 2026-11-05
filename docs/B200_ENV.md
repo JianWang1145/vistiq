@@ -1,29 +1,28 @@
-# UVA HPC B200 environment and GT plotting
+# UVA HPC B200 environment (dependency configuration only)
 
-This branch is based on `main` and includes the three GT analysis utilities
-copied from `aw-batch-test`:
-
-- `scripts/gt-analysis/match_gt_to_series.py`
-- `scripts/gt-analysis/compute_gt_f1.py`
-- `scripts/gt-analysis/plot_f1_summary.py`
-
-The plot script needs `matplotlib` and `pandas`; matplotlib is now declared
-in `pyproject.toml` under the `gt-analysis` optional dependency group.
+This `b200-uv-dependencies` branch is based on `main`. It only adds or updates
+environment configuration. It deliberately does **not** copy the analysis or
+plotting scripts from `aw-batch-test`: keep running those from the original
+`aw-batch-test` worktree, and keep the original `main` pipeline intact.
 
 ## Tested environment (UVA B200)
 
 - Python 3.12.12
-- PyTorch 2.9.1+cu128; torchvision 0.24.1+cu128
+- PyTorch 2.9.1+cu128 and torchvision 0.24.1+cu128
 - NumPy 2.1.3
 - micro_sam 1.8.14
 - CUDA 12.8 PyTorch wheels
+- `matplotlib` and `pandas` for `aw-batch-test` GT analysis plots
 
-`requirements-b200.in` is a *top-level pinned specification*, **not** the
-complete lock. The complete `requirements-b200.lock.txt` from the original HPC
-workspace is not available to this GitHub branch yet; do not assume the source
-spec alone reproduces all transitive versions.
+The repository's `pyproject.toml` has an optional `gt-analysis` dependency
+group for plotting, and `requirements-b200.in` pins the primary packages.
 
-Example starting installation using `uv` from this repository:
+**Important:** `requirements-b200.in` is only a top-level requirements
+specification. The fully resolved `requirements-b200.lock.txt` generated on
+the UVA HPC is not yet included in this branch. It is required to preserve the
+exact versions of all transitive dependencies.
+
+## Starting installation with uv
 
 ```bash
 uv venv --python 3.12 venv-b200
@@ -34,27 +33,36 @@ uv pip install --python venv-b200/bin/python -r requirements-b200.in
 uv pip check --python venv-b200/bin/python
 ```
 
-On the HPC with the original resolved lockfile, prefer the **tested** lockfile,
-which records the exact versions of the full environment. Check that CUDA
-PyTorch wheel sources remain configured correctly when syncing.
+If possible, use the original fully resolved HPC lock rather than resolving
+transitive packages anew.
 
-## Generate the per-animal GT F1 bar plot
+## Running GT analysis and F1 plots
 
-After `f1_summary.csv` has been produced:
+Use the existing `aw-batch-test` worktree on HPC; these files are **not**
+duplicated in this branch:
 
 ```bash
-export MPLBACKEND=Agg
-venv-b200/bin/python scripts/gt-analysis/plot_f1_summary.py \
-  --summary results/GT_Analysis_24h_All/f1_summary.csv \
-  --out results/GT_Analysis_24h_All/f1_by_animal.png
+cd /scratch/fcc6wd/vistiq-b200
+source env-b200.sh
+AW="$PWD/vistiq-aw/scripts/gt-analysis"
+OUT="$PWD/results/GT_Analysis_24h_All"
+GT="/project/vistiqlab/brain/24h/AkhGal4 x OR Susie/Scrib488 Dpn555 EdU 647/Raw files/samples_for_gt"
+
+"$VISTIQ_VENV/bin/python" "$AW/compute_gt_f1.py" \
+  --manifest "$OUT/gt_series_manifest.csv" \
+  --gt-dir "$GT" --jobruns-root "$OUT/legacy" \
+  --iou-threshold 0.5 \
+  --out-slices "$OUT/f1_per_slice.csv" \
+  --out-summary "$OUT/f1_summary.csv"
+
+MPLBACKEND=Agg "$VISTIQ_VENV/bin/python" "$AW/plot_f1_summary.py" \
+  --summary "$OUT/f1_summary.csv" \
+  --out "$OUT/f1_by_animal.png"
 ```
 
-The GT matching/scoring scripts come from an older pipeline format:
-`match_gt_to_series.py` expects `Preprocessed_<channel>.<channel>.tif`
-and `compute_gt_f1.py` expects `Labels_<channel>.<channel>.tif`.
-When evaluating newer `Animal-N-...scene-S.Dpn.tif` outputs, supply the
-matching manifest and legacy-compatible links as in the HPC workflow. The
-plotting script accepts the resulting summary CSV directly.
+The original GT scoring script expects the older pipeline label filenames.
+Generate the matching manifest and legacy-compatible symlinks first for the
+new `Animal-N-...scene-S.Dpn.tif` outputs.
 
-The pipeline modifications made locally on the HPC to remove image enhancement
-are **not** included in this dependency-only branch.
+The local HPC code changes to remove image enhancement during tissue
+preprocessing are not included in this dependency-only branch.
