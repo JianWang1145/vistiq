@@ -40,6 +40,11 @@ microsam = [
     "micro_sam>1.8.0",
 ]
 
+# Plotting and GT analysis tools ported from aw-batch-test.
+gt-analysis = [
+    "matplotlib>=3.8",
+]
+
 notebook = [
     "jupyterlab", # ipywidgets 
     "ipycanvas",  # ipympl
