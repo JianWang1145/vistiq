@@ -105,11 +105,200 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging level (default: INFO)",
     )
+    parser.add_argument(
+    "--finetune-dpn",
+    action="store_true",
+    help="Fine-tune MicroSAM on Dpn cell ground truth",
+    )
     return parser.parse_args(argv)
 
 
+
+
+
+
+#below is the fine tuning function(Chat wrote this and I doubled checked it to make sure it's running fine. It should be, I guess...)
+
+
+
+
+
+
+def finetune_dpn(gt_dir: Path, output_dir: Path) -> None:
+    """Fine-tune MicroSAM for Dpn cell instance segmentation."""
+    import random
+    import numpy as np
+    import tifffile
+    import torch
+    from skimage.measure import label as cc_label
+    import micro_sam.training as sam_training
+    from micro_sam.util import export_custom_sam_model
+    # 1. Find paired Dpn images and ground truth.
+    gt_files = sorted(gt_dir.glob("*.dpn.gt.tif"))
+
+    if len(gt_files) != 120:
+        raise ValueError(
+            f"Expected 120 GT images, found {len(gt_files)}"
+        )
+
+    groups = {}
+
+    for gt in gt_files:
+        raw = gt.with_name(gt.name.replace(".gt.tif", ".tif"))
+
+        if not raw.is_file():
+            raise FileNotFoundError(raw)
+
+        if "-scene-" not in gt.name:
+            raise ValueError(f"Unexpected filename: {gt.name}")
+
+        animal = gt.name.rsplit("-scene-", 1)[0]
+
+        groups.setdefault(animal, []).append((raw, gt))
+
+    if len(groups) < 2:
+        raise ValueError("Need at least two Animals for splitting")
+
+    # 2. Split by Animal, approximately 90% / 10%. (I Changed the seed to 114514. This does not matter, you can change it to any number you want. However, for the sake of reproducibility, I recommend using the same seed as me.)
+    animals = sorted(groups)
+    random.Random(114514).shuffle(animals)
+
+    choices = {0: []}
+
+    for animal in animals:
+        for count, selected in list(choices.items()):
+            new_count = count + len(groups[animal])
+            choices.setdefault(new_count, selected + [animal])
+
+    val_count = min(
+        (n for n in choices if 0 < n < len(gt_files)),
+        key=lambda n: (abs(n - 12), n),
+    )
+
+    val_animals = set(choices[val_count])
+
+    train_pairs = [
+        pair
+        for animal in animals if animal not in val_animals
+        for pair in groups[animal]
+    ]
+
+    val_pairs = [
+        pair
+        for animal in animals if animal in val_animals
+        for pair in groups[animal]
+    ]
+
+    print("Training images:", len(train_pairs))
+    print("Validation images:", len(val_pairs))
+    print("Validation Animals:", sorted(val_animals))
+
+    # Save the split for reproducibility.
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    with (output_dir / "split.txt").open("w") as f:
+        for split, pairs in (
+            ("train", train_pairs),
+            ("val", val_pairs),
+        ):
+            for raw, gt in pairs:
+                f.write(f"{split}\t{raw.name}\t{gt.name}\n")
+
+    # 3. Convert binary GT into instance labels. (Andy's note: This converts binary masks into labels. However, ajacent cells will be labeled as one cell. Remind yourself to validate this in the future. If you read this and Andy still haven't done this, please yell at him.)
+    def to_instances(mask):
+        return cc_label(
+            np.asarray(mask) > 0,
+            connectivity=2,
+        ).astype(np.int32)
+
+    # 4. Ensure MicroSAM input is in the 0–255 range.
+    def to_uint8(image):
+        x = np.asarray(image)
+
+        if x.dtype == np.uint8:
+            return x
+
+        lo, hi = np.percentile(x.astype(np.float32), [1, 99])
+
+        if hi <= lo:
+            return np.zeros(x.shape, dtype=np.uint8)
+
+        return np.clip(
+            (x - lo) * 255 / (hi - lo),
+            0,
+            255,
+        ).astype(np.uint8)
+
+    # 5. Build MicroSAM data loaders.
+    def make_loader(pairs, is_train):
+        return sam_training.default_sam_loader(
+            raw_paths=[str(raw) for raw, gt in pairs],
+            raw_key=None,
+            label_paths=[str(gt) for raw, gt in pairs],
+            label_key=None,
+            is_seg_dataset=False,
+            patch_shape=(512, 512),
+            batch_size=1,
+            pre_label_transform=to_instances,
+            raw_transform=to_uint8,
+            min_size=8,
+            with_segmentation_decoder=True,
+            is_train=is_train,
+            num_workers=2,
+            shuffle=is_train,
+        )
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA GPU is not available")
+
+    train_loader = make_loader(train_pairs, True)
+    val_loader = make_loader(val_pairs, False)
+
+    # 6. Fine-tune the pretrained MicroSAM. (Andy's note: this is the actual fine tuning part.)
+    model_output = output_dir / "output"
+    model_output.mkdir(parents=True, exist_ok=True)
+
+    sam_training.train_sam(
+        name="dpn_v1",
+        model_type="vit_l_lm",
+        train_loader=train_loader,
+        val_loader=val_loader,
+        n_epochs=20,
+        early_stopping=5,
+        n_objects_per_batch=15,
+        n_sub_iteration=4,
+        lr=1e-5,
+        with_segmentation_decoder=True,
+        device="cuda",
+        save_root=str(model_output),
+        overwrite_training=False,
+    )
+
+    # 7. Export the best checkpoint.
+    best = model_output / "checkpoints" / "dpn_v1" / "best.pt"
+
+    if not best.is_file():
+        raise FileNotFoundError(best)
+
+    exported = model_output / "dpn_v1.pth"
+
+    export_custom_sam_model(
+        checkpoint_path=str(best),
+        model_type="vit_l",
+        save_path=str(exported),
+        with_segmentation_decoder=True,
+    )
+
+    print("Exported model:", exported)
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.finetune_dpn:
+        finetune_dpn(
+            args.input.expanduser().resolve(),
+            args.output.expanduser().resolve(),
+        )
+        return 0
     logging.basicConfig(
         level=getattr(logging, args.log_level),
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
