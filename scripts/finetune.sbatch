@@ -7,7 +7,7 @@
 #SBATCH --time=12:00:00
 #SBATCH --output=dpn-finetune-%j.out
 #SBATCH --error=dpn-finetune-%j.err
-
+#SBATCH --account=siller
 set -euo pipefail
 
 # Usage:

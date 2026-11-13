@@ -20,6 +20,8 @@ import os
 import sys
 from pathlib import Path
 
+from dpn_transforms import to_instances, to_uint8
+
 import vistiq
 from vistiq.utils import check_device
 
@@ -110,6 +112,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     action="store_true",
     help="Fine-tune MicroSAM on Dpn cell ground truth",
     )
+    parser.add_argument(
+        "--dpn-checkpoint",
+        type=Path,
+        default=None,
+        help="Fine-tuned Dpn MicroSAM model (.pth). "
+             "If omitted, use pretrained MicroSAM.",
+    )
+    parser.add_argument(
+        "--eval-dpn-test",
+        action="store_true",
+        help="Run Dpn test-set segmentation and F1 evaluation",
+    )
     return parser.parse_args(argv)
 
 
@@ -127,10 +141,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def finetune_dpn(gt_dir: Path, output_dir: Path) -> None:
     """Fine-tune MicroSAM for Dpn cell instance segmentation."""
     import random
-    import numpy as np
     import tifffile
     import torch
-    from skimage.measure import label as cc_label
     import micro_sam.training as sam_training
     from micro_sam.util import export_custom_sam_model
     # 1. Find paired Dpn images and ground truth.
@@ -156,30 +168,68 @@ def finetune_dpn(gt_dir: Path, output_dir: Path) -> None:
 
         groups.setdefault(animal, []).append((raw, gt))
 
-    if len(groups) < 2:
-        raise ValueError("Need at least two Animals for splitting")
+    if len(groups) < 3:
+        raise ValueError("Need at least three Animals for splitting")
 
-    # 2. Split by Animal, approximately 90% / 10%. (I Changed the seed to 114514. This does not matter, you can change it to any number you want. However, for the sake of reproducibility, I recommend using the same seed as me.)
+    # 2. Animal-level 80% train / 10% val / 10% test split.
     animals = sorted(groups)
     random.Random(114514).shuffle(animals)
 
-    choices = {0: []}
+    total = len(gt_files)
+    target_val = total * 0.10
+    target_test = total * 0.10
+
+    # Dynamic programming: find two disjoint Animal groups
+    # whose image counts are closest to 10% each.
+    # State: (number_of_val_images, number_of_test_images)
+    states = {(0, 0): ((), ())}
 
     for animal in animals:
-        for count, selected in list(choices.items()):
-            new_count = count + len(groups[animal])
-            choices.setdefault(new_count, selected + [animal])
+        count = len(groups[animal])
+        new_states = dict(states)  # Assign animal to training.
 
-    val_count = min(
-        (n for n in choices if 0 < n < len(gt_files)),
-        key=lambda n: (abs(n - 12), n),
+        for (nv, nt), (va, ta) in states.items():
+            # Assign animal to validation.
+            new_states.setdefault(
+                (nv + count, nt),
+                (va + (animal,), ta),
+            )
+
+            # Assign animal to test.
+            new_states.setdefault(
+                (nv, nt + count),
+                (va, ta + (animal,)),
+            )
+
+        states = new_states
+
+    candidates = [
+        (counts, selected)
+        for counts, selected in states.items()
+        if counts[0] > 0
+        and counts[1] > 0
+        and sum(counts) < total
+    ]
+
+    if not candidates:
+        raise ValueError("Cannot create three nonempty Animal-level splits")
+
+    (val_count, test_count), (selected_val, selected_test) = min(
+        candidates,
+        key=lambda item: (
+            (item[0][0] - target_val) ** 2
+            + (item[0][1] - target_test) ** 2,
+            abs(item[0][0] - item[0][1]),
+        ),
     )
 
-    val_animals = set(choices[val_count])
+    val_animals = set(selected_val)
+    test_animals = set(selected_test)
+    train_animals = set(animals) - val_animals - test_animals
 
     train_pairs = [
         pair
-        for animal in animals if animal not in val_animals
+        for animal in animals if animal in train_animals
         for pair in groups[animal]
     ]
 
@@ -189,46 +239,32 @@ def finetune_dpn(gt_dir: Path, output_dir: Path) -> None:
         for pair in groups[animal]
     ]
 
-    print("Training images:", len(train_pairs))
-    print("Validation images:", len(val_pairs))
-    print("Validation Animals:", sorted(val_animals))
+    test_pairs = [
+        pair
+        for animal in animals if animal in test_animals
+        for pair in groups[animal]
+    ]
 
-    # Save the split for reproducibility.
+    print(f"Training images: {len(train_pairs)} ({len(train_pairs)/total:.1%})")
+    print(f"Validation images: {len(val_pairs)} ({len(val_pairs)/total:.1%})")
+    print(f"Test images: {len(test_pairs)} ({len(test_pairs)/total:.1%})")
+    print("Training Animals:", sorted(train_animals))
+    print("Validation Animals:", sorted(val_animals))
+    print("Test Animals:", sorted(test_animals))
+
+    # Save all three splits for reproducibility.
     output_dir.mkdir(parents=True, exist_ok=True)
 
     with (output_dir / "split.txt").open("w") as f:
         for split, pairs in (
             ("train", train_pairs),
             ("val", val_pairs),
+            ("test", test_pairs),
         ):
             for raw, gt in pairs:
                 f.write(f"{split}\t{raw.name}\t{gt.name}\n")
 
     # 3. Convert binary GT into instance labels. (Andy's note: This converts binary masks into labels. However, ajacent cells will be labeled as one cell. Remind yourself to validate this in the future. If you read this and Andy still haven't done this, please yell at him.)
-    def to_instances(mask):
-        return cc_label(
-            np.asarray(mask) > 0,
-            connectivity=2,
-        ).astype(np.int32)
-
-    # 4. Ensure MicroSAM input is in the 0–255 range.
-    def to_uint8(image):
-        x = np.asarray(image)
-
-        if x.dtype == np.uint8:
-            return x
-
-        lo, hi = np.percentile(x.astype(np.float32), [1, 99])
-
-        if hi <= lo:
-            return np.zeros(x.shape, dtype=np.uint8)
-
-        return np.clip(
-            (x - lo) * 255 / (hi - lo),
-            0,
-            255,
-        ).astype(np.uint8)
-
     # 5. Build MicroSAM data loaders.
     def make_loader(pairs, is_train):
         return sam_training.default_sam_loader(
@@ -291,8 +327,289 @@ def finetune_dpn(gt_dir: Path, output_dir: Path) -> None:
 
     print("Exported model:", exported)
 
+def evaluate_dpn_test(
+    gt_dir: Path,
+    run_dir: Path,
+    checkpoint: Path,
+) -> None:
+    """Evaluate pretrained and fine-tuned MicroSAM on the held-out Dpn test set."""
+
+    import csv
+    import numpy as np
+    import tifffile
+    import torch
+
+    from scipy.optimize import linear_sum_assignment
+    from dpn_transforms import to_uint8, to_instances
+    from micro_sam.automatic_segmentation import (
+        get_predictor_and_segmenter,
+        automatic_instance_segmentation,
+    )
+
+    split_file = run_dir / "split.txt"
+    output_dir = run_dir / "test_evaluation"
+
+    if not split_file.is_file():
+        raise FileNotFoundError(split_file)
+
+    if not checkpoint.is_file():
+        raise FileNotFoundError(checkpoint)
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA GPU is required")
+
+    # 1. Read the held-out Test images.
+    test_pairs = []
+    animal_sets = {"train": set(), "val": set(), "test": set()}
+
+    for line in split_file.read_text().splitlines():
+        if not line.strip():
+            continue
+
+        split, raw_name, gt_name = line.split("\t")
+
+        if split not in animal_sets:
+            raise ValueError(f"Unknown split: {split}")
+
+        if "-scene-" not in gt_name:
+            raise ValueError(f"Invalid GT filename: {gt_name}")
+
+        animal = gt_name.rsplit("-scene-", 1)[0]
+        animal_sets[split].add(animal)
+
+        if split == "test":
+            raw_path = gt_dir / raw_name
+            gt_path = gt_dir / gt_name
+
+            if not raw_path.is_file():
+                raise FileNotFoundError(raw_path)
+
+            if not gt_path.is_file():
+                raise FileNotFoundError(gt_path)
+
+            test_pairs.append((animal, raw_path, gt_path))
+
+    if not test_pairs:
+        raise ValueError("No test images found in split.txt")
+
+    if (
+        animal_sets["test"] & animal_sets["train"]
+        or animal_sets["test"] & animal_sets["val"]
+    ):
+        raise ValueError("Animal leakage detected!")
+
+    print("Test images:", len(test_pairs), flush=True)
+    print("Test Animals:", sorted(animal_sets["test"]), flush=True)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # 2. Calculate instance-level TP, FP, FN.
+    # A prediction counts as correct if IoU >= 0.5.
+    def count_matches(gt, pred):
+        gt = np.asarray(gt)
+        pred = np.asarray(pred)
+
+        if gt.shape != pred.shape or gt.ndim != 2:
+            raise ValueError("GT and prediction shapes do not match")
+
+        gt_ids, gi = np.unique(gt.ravel(), return_inverse=True)
+        pred_ids, pi = np.unique(pred.ravel(), return_inverse=True)
+
+        overlaps = np.bincount(
+            gi * len(pred_ids) + pi,
+            minlength=len(gt_ids) * len(pred_ids),
+        ).reshape(len(gt_ids), len(pred_ids))
+
+        g = np.flatnonzero(gt_ids > 0)
+        p = np.flatnonzero(pred_ids > 0)
+
+        n_gt = len(g)
+        n_pred = len(p)
+
+        if n_gt == 0 or n_pred == 0:
+            return 0, n_pred, n_gt
+
+        intersection = overlaps[np.ix_(g, p)].astype(float)
+
+        gt_area = overlaps.sum(axis=1)[g]
+        pred_area = overlaps.sum(axis=0)[p]
+
+        union = (
+            gt_area[:, None]
+            + pred_area[None, :]
+            - intersection
+        )
+
+        iou = np.divide(
+            intersection,
+            union,
+            out=np.zeros_like(intersection),
+            where=union > 0,
+        )
+
+        valid = iou >= 0.5
+
+        # One-to-one matching, maximizing the number of valid matches.
+        rows, cols = linear_sum_assignment(
+            -valid.astype(np.int8)
+        )
+
+        tp = int(valid[rows, cols].sum())
+        fp = n_pred - tp
+        fn = n_gt - tp
+
+        return tp, fp, fn
+
+    def calculate_f1(tp, fp, fn):
+        precision = tp / (tp + fp) if tp + fp else 0.0
+        recall = tp / (tp + fn) if tp + fn else 0.0
+        f1 = 2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn else 0.0
+
+        return precision, recall, f1
+
+    # 3. Compare pretrained and fine-tuned models.
+    models = [
+        ("pretrained", "vit_l_lm", None),
+        ("finetuned", "vit_l", str(checkpoint)),
+    ]
+
+    results = {}
+
+    with (output_dir / "per_image.csv").open(
+        "w", newline=""
+    ) as f:
+
+        writer = csv.writer(f)
+
+        writer.writerow([
+            "model", "animal", "image",
+            "tp", "fp", "fn",
+            "precision", "recall", "f1",
+        ])
+
+        for model_name, model_type, model_checkpoint in models:
+
+            print(f"Loading {model_name}", flush=True)
+
+            predictor, segmenter = get_predictor_and_segmenter(
+                model_type=model_type,
+                checkpoint=model_checkpoint,
+                segmentation_mode="ais",
+                device="cuda",
+            )
+
+            pred_dir = output_dir / "predictions" / model_name
+            pred_dir.mkdir(parents=True, exist_ok=True)
+
+            total_tp = total_fp = total_fn = 0
+
+            for index, (animal, raw_path, gt_path) in enumerate(
+                test_pairs, 1
+            ):
+                raw = tifffile.imread(raw_path)
+                binary_gt = tifffile.imread(gt_path)
+
+                if raw.ndim != 2 or binary_gt.ndim != 2:
+                    raise ValueError(
+                        f"Expected 2D images: {raw_path.name}"
+                    )
+
+                image = to_uint8(raw)
+                gt = to_instances(binary_gt)
+
+                with torch.inference_mode():
+                    pred = automatic_instance_segmentation(
+                        predictor=predictor,
+                        segmenter=segmenter,
+                        input_path=image,
+                        ndim=2,
+                        verbose=False,
+                    )
+
+                pred = np.asarray(pred)
+
+                tp, fp, fn = count_matches(gt, pred)
+                precision, recall, f1 = calculate_f1(tp, fp, fn)
+
+                total_tp += tp
+                total_fp += fp
+                total_fn += fn
+
+                tifffile.imwrite(
+                    pred_dir / f"{raw_path.stem}_instances.tif",
+                    pred.astype(np.uint32),
+                )
+
+                writer.writerow([
+                    model_name,
+                    animal,
+                    raw_path.name,
+                    tp, fp, fn,
+                    precision, recall, f1,
+                ])
+
+                f.flush()
+
+                print(
+                    f"{model_name} [{index}/{len(test_pairs)}] "
+                    f"F1={f1:.4f} {raw_path.name}",
+                    flush=True,
+                )
+
+            precision, recall, f1 = calculate_f1(
+                total_tp, total_fp, total_fn
+            )
+
+            results[model_name] = [
+                total_tp, total_fp, total_fn,
+                precision, recall, f1,
+            ]
+
+            del predictor, segmenter
+            torch.cuda.empty_cache()
+
+    # 4. Save final results.
+    summary_path = output_dir / "summary.csv"
+
+    with summary_path.open("w", newline="") as f:
+        writer = csv.writer(f)
+
+        writer.writerow([
+            "model", "tp", "fp", "fn",
+            "precision", "recall", "f1",
+        ])
+
+        for model_name, values in results.items():
+            writer.writerow([model_name, *values])
+
+    print("\n=== FINAL TEST RESULTS ===", flush=True)
+
+    for name, values in results.items():
+        print(
+            f"{name}: "
+            f"Precision={values[3]:.4f}, "
+            f"Recall={values[4]:.4f}, "
+            f"F1={values[5]:.4f}",
+            flush=True,
+        )
+
+    print("Saved:", summary_path, flush=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.eval_dpn_test:
+        if args.dpn_checkpoint is None:
+            raise ValueError(
+                "--eval-dpn-test requires --dpn-checkpoint"
+            )
+
+        evaluate_dpn_test(
+            args.input.expanduser().resolve(),
+            args.output.expanduser().resolve(),
+            args.dpn_checkpoint.expanduser().resolve(),
+        )
+        return 0
     if args.finetune_dpn:
         finetune_dpn(
             args.input.expanduser().resolve(),
@@ -340,6 +657,7 @@ def main(argv: list[str] | None = None) -> int:
             tissue_labels_mode=args.tissue_labels,
             channel_names=channel_names,
             channels_from_filename=args.channels_from_filename,
+            dpn_checkpoint=args.dpn_checkpoint,
         )
     except Exception:
         logger.exception("Full pipeline failed for %s", input_path)

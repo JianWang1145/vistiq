@@ -337,11 +337,13 @@ def build_tissue_segmentation_config(
     )
 
 
-def build_cell_segmentation_config(embedding_path: Path) -> SegmentationFlowConfig:
+def build_cell_segmentation_config(embedding_path: Pathc, heckpoint: Path | None = None,) -> SegmentationFlowConfig:
     min_cell_radius = 2.0
     max_cell_radius = 7.0
     return SegmentationFlowConfig(
         segmenter=MicroSAMSegmenterConfig(
+            model_type="vit_l" if checkpoint else "vit_l_lm",
+            checkpoint=str(checkpoint) if checkpoint else None,
             iterator_config=ArrayIteratorConfig(slice_def=()),
             embedding_path=str(embedding_path),
         ),
@@ -500,6 +502,7 @@ def run_full_pipeline(
     tissue_labels_mode: TissueLabelsMode = "2d",
     channel_names: list[str] | None = None,
     channels_from_filename: bool = False,
+    dpn_checkpoint: Path | None = None,
 ) -> dict[str, Path]:
     """Run the GWAS notebook pipeline for a single image file."""
     img_path = img_path.expanduser().resolve()
@@ -533,7 +536,6 @@ def run_full_pipeline(
     tissue_ppcfg = build_tissue_preprocess_config(tissue_labels_mode)
     tsfcfg = build_tissue_segmentation_config(embedding_path, tissue_labels_mode)
     cell_ppcfg = build_cell_preprocess_config()
-    cell_sfcfg = build_cell_segmentation_config(embedding_path)
     acfg = build_analysis_config()
 
     logger.info("Preprocessing tissue")
@@ -594,10 +596,50 @@ def run_full_pipeline(
         axis=metadata["channel_axis"],
         strict=False,
     )
-    cell_labels = [
-        SegmentationFlow(cell_sfcfg).run(ch, metadata=ch_meta)
-        for ch, ch_meta in zip(channels, channel_metadata)
-    ]
+    cell_labels = []
+    dpn_found = False
+
+    for ch, ch_meta in zip(channels, channel_metadata):
+
+        channel_name = ch_meta["channel_names"][0]
+        is_dpn = channel_name.lower() == "dpn"
+
+        if is_dpn:
+            dpn_found = True
+
+        if is_dpn and dpn_checkpoint is not None:
+            # Use fine-tuned model only for Dpn.
+            config = build_cell_segmentation_config(
+                embedding_path / "dpn_finetuned",
+                checkpoint=dpn_checkpoint,
+            )
+            logger.info(
+                "Segmenting %s with fine-tuned model: %s",
+                channel_name,
+                dpn_checkpoint,
+            )
+        else:
+            # All other channels keep the original model.
+            config = build_cell_segmentation_config(
+                embedding_path,
+            )
+            logger.info(
+                "Segmenting %s with pretrained MicroSAM",
+                channel_name,
+            )
+
+        labels = SegmentationFlow(config).run(
+            ch,
+            metadata=ch_meta,
+        )
+
+        cell_labels.append(labels)
+
+    if dpn_checkpoint is not None and not dpn_found:
+        raise ValueError(
+            "A Dpn checkpoint was provided, but no Dpn channel was found."
+        )
+
 
     combined_labels = [brain_label, tissue_labels, *cell_labels]
     combined_metadata = [brain_metadata, tissue_metadata, *channel_metadata]
