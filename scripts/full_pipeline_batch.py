@@ -124,6 +124,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Run Dpn test-set segmentation and F1 evaluation",
     )
+    parser.add_argument(
+        "--reuse-dpn-predictions",
+        action="store_true",
+        help="Evaluate existing test predictions without GPU inference",
+    )
     return parser.parse_args(argv)
 
 
@@ -330,21 +335,24 @@ def finetune_dpn(gt_dir: Path, output_dir: Path) -> None:
 def evaluate_dpn_test(
     gt_dir: Path,
     run_dir: Path,
-    checkpoint: Path,
+    checkpoint: Path | None,
+    reuse_predictions: bool = False,
 ) -> None:
     """Evaluate pretrained and fine-tuned MicroSAM on the held-out Dpn test set."""
 
     import csv
     import numpy as np
     import tifffile
-    import torch
 
     from scipy.optimize import linear_sum_assignment
     from dpn_transforms import to_uint8, to_instances
-    from micro_sam.automatic_segmentation import (
-        get_predictor_and_segmenter,
-        automatic_instance_segmentation,
-    )
+
+    if not reuse_predictions:
+        import torch
+        from micro_sam.automatic_segmentation import (
+            get_predictor_and_segmenter,
+            automatic_instance_segmentation,
+        )
 
     split_file = run_dir / "split.txt"
     output_dir = run_dir / "test_evaluation"
@@ -352,11 +360,11 @@ def evaluate_dpn_test(
     if not split_file.is_file():
         raise FileNotFoundError(split_file)
 
-    if not checkpoint.is_file():
-        raise FileNotFoundError(checkpoint)
-
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA GPU is required")
+    if not reuse_predictions:
+        if checkpoint is None or not checkpoint.is_file():
+            raise FileNotFoundError(checkpoint)
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA GPU is required")
 
     # 1. Read the held-out Test images.
     test_pairs = []
@@ -426,9 +434,6 @@ def evaluate_dpn_test(
         n_gt = len(g)
         n_pred = len(p)
 
-        if n_gt == 0 or n_pred == 0:
-            return 0, n_pred, n_gt
-
         intersection = overlaps[np.ix_(g, p)].astype(float)
 
         gt_area = overlaps.sum(axis=1)[g]
@@ -449,16 +454,34 @@ def evaluate_dpn_test(
 
         valid = iou >= 0.5
 
-        # One-to-one matching, maximizing the number of valid matches.
-        rows, cols = linear_sum_assignment(
-            -valid.astype(np.int8)
-        )
+        # Maximize TP count first, then IoU among valid matches.
+        matches = {}
+        if n_gt and n_pred:
+            bonus = np.where(valid, iou, 0.0) / (min(n_gt, n_pred) + 1)
+            rows, cols = linear_sum_assignment(-(valid.astype(float) + bonus))
+            matches = {int(r): int(c) for r, c in zip(rows, cols) if valid[r, c]}
 
-        tp = int(valid[rows, cols].sum())
-        fp = n_pred - tp
-        fn = n_gt - tp
+        # Keep all GT objects, including misses. Record best overlap separately.
+        object_rows = []
+        for r in range(n_gt):
+            c = matches.get(r)
+            object_rows.append((
+                int(gt_ids[g[r]]),
+                int(pred_ids[p[c]]) if c is not None else "",
+                float(iou[r, c]) if c is not None else 0.0,
+                float(iou[r].max()) if n_pred else 0.0,
+                "TP" if c is not None else "FN",
+            ))
+        matched_cols = set(matches.values())
+        for c in range(n_pred):
+            if c not in matched_cols:
+                object_rows.append((
+                    "", int(pred_ids[p[c]]), 0.0,
+                    float(iou[:, c].max()) if n_gt else 0.0, "FP",
+                ))
 
-        return tp, fp, fn
+        tp = len(matches)
+        return tp, n_pred - tp, n_gt - tp, object_rows
 
     def calculate_f1(tp, fp, fn):
         precision = tp / (tp + fp) if tp + fp else 0.0
@@ -473,13 +496,26 @@ def evaluate_dpn_test(
         ("finetuned", "vit_l", str(checkpoint)),
     ]
 
+    if reuse_predictions:
+        for model_name, _, _ in models:
+            for _, raw_path, _ in test_pairs:
+                path = output_dir / "predictions" / model_name / f"{raw_path.stem}_instances.tif"
+                if not path.is_file():
+                    raise FileNotFoundError(path)
+
     results = {}
+    object_path = output_dir / "per_object.csv"
 
     with (output_dir / "per_image.csv").open(
         "w", newline=""
-    ) as f:
+    ) as f, object_path.open("w", newline="") as obj:
 
         writer = csv.writer(f)
+        object_writer = csv.writer(obj)
+        object_writer.writerow([
+            "model", "animal", "image", "gt_id", "pred_id",
+            "iou", "best_iou", "status",
+        ])
 
         writer.writerow([
             "model", "animal", "image",
@@ -489,14 +525,16 @@ def evaluate_dpn_test(
 
         for model_name, model_type, model_checkpoint in models:
 
-            print(f"Loading {model_name}", flush=True)
-
-            predictor, segmenter = get_predictor_and_segmenter(
-                model_type=model_type,
-                checkpoint=model_checkpoint,
-                segmentation_mode="ais",
-                device="cuda",
-            )
+            if reuse_predictions:
+                print(f"Re-scoring {model_name}", flush=True)
+            else:
+                print(f"Loading {model_name}", flush=True)
+                predictor, segmenter = get_predictor_and_segmenter(
+                    model_type=model_type,
+                    checkpoint=model_checkpoint,
+                    segmentation_mode="ais",
+                    device="cuda",
+                )
 
             pred_dir = output_dir / "predictions" / model_name
             pred_dir.mkdir(parents=True, exist_ok=True)
@@ -517,28 +555,41 @@ def evaluate_dpn_test(
                 image = to_uint8(raw)
                 gt = to_instances(binary_gt)
 
-                with torch.inference_mode():
-                    pred = automatic_instance_segmentation(
-                        predictor=predictor,
-                        segmenter=segmenter,
-                        input_path=image,
-                        ndim=2,
-                        verbose=False,
-                    )
+                pred_path = pred_dir / f"{raw_path.stem}_instances.tif"
+                if reuse_predictions:
+                    pred = tifffile.imread(pred_path)
+                else:
+                    with torch.inference_mode():
+                        pred = automatic_instance_segmentation(
+                            predictor=predictor,
+                            segmenter=segmenter,
+                            input_path=image,
+                            ndim=2,
+                            verbose=False,
+                        )
 
                 pred = np.asarray(pred)
 
-                tp, fp, fn = count_matches(gt, pred)
+                tp, fp, fn, object_rows = count_matches(gt, pred)
+                for gt_id, pred_id, score, best, status in object_rows:
+                    object_writer.writerow([
+                        model_name, animal, raw_path.name,
+                        gt_id, pred_id, score, best, status,
+                    ])
+                    print(
+                        f"{model_name} {raw_path.name} GT={gt_id or '-'} "
+                        f"Pred={pred_id or '-'} IoU={score:.4f} "
+                        f"BestIoU={best:.4f} {status}", flush=True,
+                    )
+                obj.flush()
                 precision, recall, f1 = calculate_f1(tp, fp, fn)
 
                 total_tp += tp
                 total_fp += fp
                 total_fn += fn
 
-                tifffile.imwrite(
-                    pred_dir / f"{raw_path.stem}_instances.tif",
-                    pred.astype(np.uint32),
-                )
+                if not reuse_predictions:
+                    tifffile.imwrite(pred_path, pred.astype(np.uint32))
 
                 writer.writerow([
                     model_name,
@@ -565,8 +616,9 @@ def evaluate_dpn_test(
                 precision, recall, f1,
             ]
 
-            del predictor, segmenter
-            torch.cuda.empty_cache()
+            if not reuse_predictions:
+                del predictor, segmenter
+                torch.cuda.empty_cache()
 
     # 4. Save final results.
     summary_path = output_dir / "summary.csv"
@@ -594,12 +646,15 @@ def evaluate_dpn_test(
         )
 
     print("Saved:", summary_path, flush=True)
+    print("Saved:", object_path, flush=True)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.reuse_dpn_predictions and not args.eval_dpn_test:
+        raise ValueError("--reuse-dpn-predictions requires --eval-dpn-test")
     if args.eval_dpn_test:
-        if args.dpn_checkpoint is None:
+        if args.dpn_checkpoint is None and not args.reuse_dpn_predictions:
             raise ValueError(
                 "--eval-dpn-test requires --dpn-checkpoint"
             )
@@ -607,7 +662,8 @@ def main(argv: list[str] | None = None) -> int:
         evaluate_dpn_test(
             args.input.expanduser().resolve(),
             args.output.expanduser().resolve(),
-            args.dpn_checkpoint.expanduser().resolve(),
+            args.dpn_checkpoint.expanduser().resolve() if args.dpn_checkpoint else None,
+            reuse_predictions=args.reuse_dpn_predictions,
         )
         return 0
     if args.finetune_dpn:
